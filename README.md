@@ -1,120 +1,110 @@
-# HakiOS on the Samsung Galaxy A32 4G
+# hakios-a32
 
-An experimental iOS 16.5 port for the Samsung Galaxy A32 4G, developed from [Luminous418’s original Galaxy A32 port](https://github.com/Luminous418/hakios-a32).
+HakiOS for the **Samsung Galaxy A32 4G (SM-A325F)**: MediaTek Helio G80 (**MT6769T**), GPU
+**Mali-G52 MC2**, eMMC. iOS 16.5's own user space (launchd → backboardd → SpringBoard → apps)
+on Apple's open XNU kernel (xnu-8796.121.2), with this phone's own loader and drivers.
 
-This repository documents later work on the **SM-A325M** variant: booting iOS, bringing up hardware, improving rendering, and investigating the remaining compatibility problems. It is a research project, **not a stable ROM or a ready-to-flash release**.
+The A32 is a **legacy non-A/B** phone: its boot partition is `boot` (there is no `boot_a`
+and no slot B).
 
-## Credits
+Nothing on the phone is replaced for good: `mtkloader` sits in `boot` in front of Android's
+own kernel, starts XNU once when Android asks for it, and the phone comes back to Android
+after every run. The iOS system image lives in a partition of its own (`xnusys`, carved from
+the end of `userdata`) and the kernel reads it off the eMMC as it needs it.
 
-**Luminous418 created the original HakiOS Galaxy A32 device port.** That work provided the foundation for this project and must retain its original attribution and license notices.
+## What works
 
-The later SM-A325M experiments were carried out by **Mauri with Codex**, building on Luminous418’s device work and the broader HakiOS project.
+| | | |
+| --- | --- | --- |
+| boot | works | `mtkloader/`: MMU off, eMMC through MSDC0, device tree and boot arguments for XNU; 4 cores |
+| storage | works, read only | the system image read off the eMMC as needed (`emmc_root=1`): 4 GiB `xnusys`, ~2.5 GB of iOS |
+| display | works | 1080×2400 command-mode DSI, iOS at scale 3; the loader's watcher kicks the panel and checks DSI busy (`kernel/iokit/Kernel/MiniIOMobileFramebuffer.cpp`, `mtk_kick=0`) |
+| touch | works | STM FTS5CU56A on I2C6 at 0x49, bit-banged on GPIO89/90 (`kernel/bsd/dev/hakios.fts.c`); its two rails (GPIO4 and PMIC VCAMA2) are switched on from the kernel |
+| buttons | works | power and volume up/down (`kernel/bsd/dev/hakios.mtkkeys.c`) |
+| GPU | works | Mali-G52 r1p0 (step 6/6), `RedwoodMali`, Mesa panfrost and **CoreAnimation on the GPU** (`GL=1 gl=1`): 21,729 job chains, 0 failed, 21–31 fps peaks; with panfrost's BO cache retained and its tiler heap lazy (32 MB) a 5-minute run had no respring (one app, Photos, crashed), see `docs/gpu-a32.md` |
+| Metal | works | the `y2sios` runtime (`libredwoodair` + `RedwoodMetal.bundle`) on this GPU: a system `.metallib` draws `THE SAME` as softpipe's reference pixel, 64/64 shaders at panel size (`--picture`), and **CoreAnimation runs on Metal** (`metal=1 metal_plugin=1`): home screen, icons, dock at ~26 fps and a gradient wallpaper drawn behind the icons, no respring (boot-arg `wallpaper=1`); widgets and a 60 Hz frame rate still missing, see `docs/metal-a32.md` |
+| CPU | works | 4 cores; A75 at 1999 MHz and A55 at 1699 MHz with `mtk_cpufreq=3` (`kernel/bsd/dev/hakios.mtkcpufreq.c`); a ten-minute run stayed there (`docs/stability-a32.md`) |
+| battery | works | MT6358 `BATADC` (voltage, 3:1 divider) and `CHRDET`, `battery=2`; temperature and current are still placeholders |
+| sensors | partial | the SCP sensor hub runs and the accelerometer streams (`scp_step=6`, `kernel/bsd/dev/hakios.scp.c`); turning the samples into screen rotation is still user-space work |
+| Wi-Fi / Bluetooth, audio, camera, cellular | missing | |
 
-If you reuse these sources, please credit the original authors and preserve the included MIT and APSL 2.0 notices.
+### GPU: what is and what is not
 
-## Device and software
+`kernel/bsd/dev/hakios.mali.c` (boot-arg `mali=1`) is the Infinix Hot 20's Mali-G52 bring-up
+ported to this phone. It gets all the way to step 6 of 6:
 
-| Component | Tested configuration |
-| --- | --- |
-| Phone | Samsung Galaxy A32 4G, SM-A325M |
-| SoC | MediaTek Helio G80 family |
-| GPU | Mali-G52 |
-| iOS version | iOS 16.5 |
-| Kernel | HakiOS adaptation of XNU |
-| Graphics path | Mali/Panfrost with OpenGL ES |
-| Android boot | Chainboot arrangement using the device’s own boot image |
+```
+mali: GPU_ID 0x74021000 (Mali-G52 r1p0), shader cores 0x3, tiler 0x1, L2 0x1: all powered
+mali: first job, identity mode ... the word 0xc0ffee01 -- the GPU ran it
+mali: second job, through the GPU's page tables ... -- the GPU ran it
+mali: came up to step 6 of 6
+```
 
-The upstream project targets the **SM-A325F**. Although the SM-A325M is closely related, model and firmware differences matter. Nothing in this repository should be assumed compatible with the Galaxy A32 5G or another Samsung device.
+The GPU itself works, and the layer above it does too: `RedwoodMali` speaks panfrost's DRM
+interface to Mesa (`GL=1`, CoreAnimation on the GPU; `docs/gpu-a32.md`), and the public
+`y2sios` Mali Metal runtime finds this phone's GPU through `RedwoodMetal.bundle`
+(`metal=1`; `docs/metal-a32.md`). The Infinix's own panfrost/Metal work is not published; what
+runs here is the public `y2sios` runtime on this phone's kernel and Bifrost compiler. Leaving
+`mali=1` on changes nothing else: the GPU stays powered and tested.
 
-## What we achieved
+## What is here
 
-On one SM-A325M, iOS 16.5 reached the lock screen and SpringBoard, and the interface accepted touch input. We were able to open and use parts of the system rather than stopping at a boot logo.
+- `mtkloader/` — the bare-metal loader (MIT): chains in front of Android's kernel in
+  `boot`, relocates itself and XNU to `0x40080000`, reads the eMMC, builds XNU's device
+  tree and boot arguments, and brings Android back with XNU's log in `pstore`.
+- `kernel/` — this phone's drivers and changes in XNU (APSL 2.0, see `kernel/README.md`).
+- `tools/` — `chainboot.py` (pack a bare-metal program in front of Android's kernel) and
+  `mktouchfw.py` (kept for the project's other phones; the A32's touch needs no firmware).
+- `diag/` — `a32diag`, the first program that proved the chainboot and the framebuffer on
+  this phone.
+- `docs/` — how the display, the touch screen, the buttons and the GPU were found, register
+  by register.
+- `device.conf` — the phone and the state of each component.
 
-The following worked in at least some tests:
+## Not here, by design
 
-- iOS boot and SpringBoard
-- Touch input
-- Screen brightness control
-- Flashlight
-- Wi‑Fi association and Internet access
-- A persistent iOS data volume
-- An Android app that requested a one-time iOS boot
-- An iOS app that returned to Android in earlier tests
+No file of iOS, no firmware of the phone, no boot/partition image, no screenshot, no
+`xnuloader/identity.h` (made from your own IPSW), no log with a device's data. `LEGAL.md`
+says it in full. Build outputs (`*.o`, `*.bin`, `*.img`, generated headers) are ignored by
+`.gitignore`.
 
-The persistent data volume was configured at approximately **24 GiB** for the test device. That number describes our particular partition layout; it is not a safe partitioning recipe for other phones.
+## Running
 
-## Current limitations
+What it needs:
+- a Galaxy A32 4G (SM-A325F) with an unlocked bootloader, Android 13 rooted (Magisk), and
+  its stock `boot` image saved;
+- a Mac with the common HakiOS tree (kernel build, user space, the iOS system image made
+  from your own IPSW).
 
-This port is still experimental. A successful boot does not mean that every service or app works.
+The loader and the kernel are built from the common tree; this repository holds the phone's
+pieces:
 
-| Area | Current state |
-| --- | --- |
-| Rendering | GPU rendering works through Mali/Panfrost and OpenGL ES, but visual artifacts remain. |
-| Performance | The interface is usable in places but still noticeably slow. A 90 Hz panel setting does not mean iOS renders at 90 FPS. |
-| Metal | A complete, working Metal backend was not established in these tests. |
-| Keyboard | Keys at the right edge can be clipped. The cause was investigated but not fixed. |
-| Audio | Not confirmed working. |
-| Bluetooth | Not confirmed working. |
-| Camera | Not confirmed working. |
-| Cellular/RIL | Calls, SMS, and mobile data were not integrated or verified. |
-| Apps and jailbreak | Some apps were unstable. Sileo launched, but installing packages and using tweaks were not fully verified. |
-| Return to Android | The app and five-finger gesture worked in earlier sessions but both failed in the last long-session test. |
+```sh
+export HAKIOS_SERIAL=...                 # your phone, as `adb devices` shows it
+# build mtkloader and the kernel with the common tree, then pack boot:
+python3 tools/chainboot.py stock-boot.img mtkloader.bin boot-a32.img xnu-payload.bin
+```
 
-The final long-session test also exposed a boot configuration error: iOS had accidentally been set as the default boot target. Reflashing a corrected boot image restored Android as the default. A forced restart left the iOS data volume marked dirty. **That final return failure has not been fixed or retested.**
+One run, with the A32 pieces enabled:
 
-## Why there is no universal flashable ZIP
+```
+cpus=4 fbscale=3 touchscreen=3 buttons=2 mali=1
+```
 
-The tested setup depended on files specific to the owner and the exact phone:
+`boot` boots Android by default. To ask for one XNU run, from Android:
 
-- An iOS 16.5 IPSW obtained by the tester
-- The phone’s matching Samsung stock boot image and firmware
-- A device-specific boot image
-- An iOS system image and prepared partitions
-- A compatible recovery and an unlocked bootloader
+```sh
+adb shell 'printf DARWIN-REDWOOD:BOOT-XNU > /dev/pmsg0'
+adb reboot
+```
 
-A boot image from one phone is not a safe general release for every A32. Flashing it without the matching system image and partition layout would not install a working iOS system.
+XNU runs for the loader's watchdog (300 s is the value used here), returns to the loader,
+and the loader starts Android with the run's log in
+`/sys/fs/pstore/console-ramoops-2` (readable without root on this phone). Do not reboot by
+hand while XNU runs: that loses the log. Five fingers held on the screen for 1.5 s also
+return to the loader and keep it.
 
-This repository must not distribute Apple’s iOS binaries, Samsung firmware, another person’s stock boot image, credentials, or user data. Anyone developing from these sources needs to supply and build their own inputs and verify the resulting images for their device.
+## Licenses
 
-**Do not flash the source ZIP in recovery.** It is source code, not an installer.
-
-## Installation and development
-
-Start with [Luminous418’s upstream repository](https://github.com/Luminous418/hakios-a32) and its installation documentation. That guide describes the original baseline, not a verified one-command installation of our later SM-A325M experiments.
-
-Before attempting an independent build:
-
-1. Confirm the phone’s exact model and firmware revision.
-2. Save and verify a restorable copy of its stock boot image.
-3. Confirm that its bootloader can be unlocked and that recovery works.
-4. Build the iOS system and device boot image from your own required inputs.
-5. Inspect the partition layout on the actual phone before making any changes.
-6. Check that **Android is the default boot target** and iOS starts only through a one-time request.
-7. Verify image hashes and keep a tested recovery path.
-
-Creating iOS partitions can modify the partition table and erase Android user data. Do not copy partition offsets or images from another phone.
-
-## Research priorities
-
-The next areas to investigate are:
-
-1. Correct the remaining black regions, clipped elements, and other rendering defects.
-2. Find and remove the largest frame-time costs.
-3. Fix the keyboard’s right-edge layout and verify that visual positions match touch targets.
-4. Make the return-to-Android paths reliable, including orderly storage shutdown.
-5. Bring up and validate audio, Bluetooth, camera, and cellular services.
-6. Explore a practical Metal implementation or translation layer for the Mali GPU.
-
-These are goals, not promises of working features.
-
-## Contributing
-
-Reproducible findings are especially valuable. Please include the exact phone model, firmware build, what changed, how you tested it, and what the device actually displayed or logged. Keep personal data, Wi‑Fi credentials, device identifiers, firmware dumps, and copyrighted system files out of issues and pull requests.
-
-When contributing work derived from the original device port, retain credit to **Luminous418**. Files derived from XNU must keep their applicable APSL 2.0 notices; do not relicense them as MIT.
-
-## License and attribution
-
-This project contains components under different licenses. Preserve the original **MIT** and **Apple Public Source License 2.0 (APSL 2.0)** files and notices from the relevant sources. Check each file’s origin before redistributing or relicensing it.
-
-HakiOS is an independent research effort. It is not affiliated with or endorsed by Apple or Samsung. Apple, iOS, Samsung, Galaxy, and other product names belong to their respective owners.
+`kernel/` is APSL 2.0 (`LICENSE.APSL`), as code built into XNU; everything else is MIT
+(`LICENSE`). See `NOTICE` and `LEGAL.md`.
